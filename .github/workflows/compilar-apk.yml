@@ -1,0 +1,480 @@
+name: Compilar APK
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crear codigo de la app
+        run: |
+          cat > settings.gradle <<'FIN'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BloqueadorLlamadas"
+          include ':app'
+          FIN
+          cat > build.gradle <<'FIN'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          FIN
+          cat > gradle.properties <<'FIN'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          FIN
+          mkdir -p app
+          cat > app/build.gradle <<'FIN'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'cl.bloqueador.llamadas'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'cl.bloqueador.llamadas'
+                  minSdk 29
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+              }
+
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          FIN
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FIN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.DayNight">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BloqueadorService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_SCREENING_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.telecom.CallScreeningService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          FIN
+          mkdir -p app/src/main/java/cl/bloqueador/llamadas
+          cat > app/src/main/java/cl/bloqueador/llamadas/BloqueadorService.java <<'FIN'
+          package cl.bloqueador.llamadas;
+
+          import android.net.Uri;
+          import android.telecom.Call;
+          import android.telecom.CallScreeningService;
+
+          public class BloqueadorService extends CallScreeningService {
+
+              @Override
+              public void onScreenCall(Call.Details details) {
+                  CallResponse.Builder respuesta = new CallResponse.Builder();
+
+                  if (details.getCallDirection() == Call.Details.DIRECTION_INCOMING) {
+                      Uri handle = details.getHandle();
+                      String numero = handle == null ? null : handle.getSchemeSpecificPart();
+                      String motivo = Reglas.motivoBloqueo(this, numero);
+
+                      if (motivo != null) {
+                          respuesta.setDisallowCall(true)
+                                  .setRejectCall(true)
+                                  .setSkipNotification(true)
+                                  .setSkipCallLog(false);
+                          Registro.agregar(this, numero, motivo);
+                      }
+                  }
+                  respondToCall(details, respuesta.build());
+              }
+          }
+          FIN
+          cat > app/src/main/java/cl/bloqueador/llamadas/MainActivity.java <<'FIN'
+          package cl.bloqueador.llamadas;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.role.RoleManager;
+          import android.content.pm.PackageManager;
+          import android.graphics.Typeface;
+          import android.os.Bundle;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Switch;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+
+              private static final int REQ_ROL = 1;
+              private static final int REQ_CONTACTOS = 2;
+
+              private TextView estado;
+              private Button botonActivar;
+              private TextView historial;
+              private Switch swContactos;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  int pad = dp(16);
+                  LinearLayout raiz = new LinearLayout(this);
+                  raiz.setOrientation(LinearLayout.VERTICAL);
+                  raiz.setPadding(pad, pad, pad, pad);
+
+                  TextView titulo = new TextView(this);
+                  titulo.setText(R.string.app_name);
+                  titulo.setTextSize(24);
+                  titulo.setTypeface(Typeface.DEFAULT_BOLD);
+                  raiz.addView(titulo);
+
+                  estado = new TextView(this);
+                  estado.setPadding(0, dp(8), 0, dp(8));
+                  raiz.addView(estado);
+
+                  botonActivar = new Button(this);
+                  botonActivar.setText("Activar bloqueador");
+                  botonActivar.setOnClickListener(v -> pedirRol());
+                  raiz.addView(botonActivar);
+
+                  raiz.addView(seccion("Qué bloquear"));
+                  raiz.addView(interruptor("Bloqueo activado", Reglas.ACTIVO));
+                  raiz.addView(interruptor("Números extranjeros (no +56)", Reglas.EXTRANJEROS));
+                  raiz.addView(interruptor("Telemarketing no solicitado (809)", Reglas.P809));
+                  raiz.addView(interruptor("Empresas con las que tienes contrato (600)", Reglas.P600));
+                  raiz.addView(interruptor("Números ocultos / privados", Reglas.OCULTOS));
+
+                  swContactos = interruptor("Dejar pasar siempre a mis contactos", Reglas.CONTACTOS);
+                  swContactos.setOnCheckedChangeListener((b, on) -> {
+                      Reglas.prefs(this).edit().putBoolean(Reglas.CONTACTOS, on).apply();
+                      if (on) pedirContactos();
+                  });
+                  raiz.addView(swContactos);
+
+                  TextView nota = new TextView(this);
+                  nota.setText("Las llamadas del Estado (702) nunca se bloquean.");
+                  nota.setTextSize(12);
+                  nota.setPadding(0, dp(4), 0, 0);
+                  raiz.addView(nota);
+
+                  raiz.addView(seccion("Llamadas bloqueadas"));
+                  historial = new TextView(this);
+                  historial.setTextIsSelectable(true);
+                  raiz.addView(historial);
+
+                  Button borrar = new Button(this);
+                  borrar.setText("Borrar historial");
+                  borrar.setOnClickListener(v -> {
+                      Registro.borrar(this);
+                      refrescar();
+                  });
+                  raiz.addView(borrar);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(raiz, new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  setContentView(scroll);
+
+                  if (Reglas.get(this, Reglas.CONTACTOS)) pedirContactos();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  refrescar();
+              }
+
+              private void refrescar() {
+                  boolean activo = tieneRol();
+                  estado.setText(activo
+                          ? "✅ El bloqueador está funcionando."
+                          : "⚠️ Falta un paso: toca \"Activar bloqueador\" y elige esta app como "
+                            + "app de identificación de llamadas y spam.");
+                  botonActivar.setEnabled(!activo);
+                  String h = Registro.leer(this);
+                  historial.setText(h.isEmpty() ? "Todavía no se ha bloqueado ninguna llamada." : h);
+              }
+
+              private boolean tieneRol() {
+                  RoleManager rm = getSystemService(RoleManager.class);
+                  return rm != null && rm.isRoleHeld(RoleManager.ROLE_CALL_SCREENING);
+              }
+
+              @SuppressWarnings("deprecation")
+              private void pedirRol() {
+                  RoleManager rm = getSystemService(RoleManager.class);
+                  if (rm == null || !rm.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
+                      estado.setText("Este teléfono no permite apps de filtro de llamadas.");
+                      return;
+                  }
+                  startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING), REQ_ROL);
+              }
+
+              private void pedirContactos() {
+                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.READ_CONTACTS}, REQ_CONTACTOS);
+                  }
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  refrescar();
+              }
+
+              private Switch interruptor(String texto, String clave) {
+                  Switch s = new Switch(this);
+                  s.setText(texto);
+                  s.setTextSize(16);
+                  s.setPadding(0, dp(10), 0, dp(10));
+                  s.setChecked(Reglas.get(this, clave));
+                  s.setOnCheckedChangeListener((b, on) ->
+                          Reglas.prefs(this).edit().putBoolean(clave, on).apply());
+                  return s;
+              }
+
+              private TextView seccion(String texto) {
+                  TextView t = new TextView(this);
+                  t.setText(texto);
+                  t.setTextSize(18);
+                  t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setPadding(0, dp(24), 0, dp(4));
+                  return t;
+              }
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+          }
+          FIN
+          cat > app/src/main/java/cl/bloqueador/llamadas/Registro.java <<'FIN'
+          package cl.bloqueador.llamadas;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          public final class Registro {
+
+              private static final String PREFS = "registro";
+              private static final String CLAVE = "lineas";
+              private static final int MAX = 100;
+
+              private Registro() {}
+
+              public static synchronized void agregar(Context c, String numero, String motivo) {
+                  SharedPreferences p = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                  String fecha = new SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()).format(new Date());
+                  String linea = fecha + "  " + (numero == null || numero.isEmpty() ? "Oculto" : numero)
+                          + "  · " + motivo;
+
+                  String previo = p.getString(CLAVE, "");
+                  String[] lineas = previo.isEmpty() ? new String[0] : previo.split("\n");
+                  StringBuilder b = new StringBuilder(linea);
+                  for (int i = 0; i < lineas.length && i < MAX - 1; i++) b.append('\n').append(lineas[i]);
+                  p.edit().putString(CLAVE, b.toString()).apply();
+              }
+
+              public static String leer(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(CLAVE, "");
+              }
+
+              public static void borrar(Context c) {
+                  c.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply();
+              }
+          }
+          FIN
+          cat > app/src/main/java/cl/bloqueador/llamadas/Reglas.java <<'FIN'
+          package cl.bloqueador.llamadas;
+
+          import android.Manifest;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.provider.ContactsContract;
+
+          public final class Reglas {
+
+              public static final String PREFS = "config";
+              public static final String ACTIVO = "activo";
+              public static final String EXTRANJEROS = "extranjeros";
+              public static final String P809 = "p809";
+              public static final String P600 = "p600";
+              public static final String OCULTOS = "ocultos";
+              public static final String CONTACTOS = "contactos";
+
+              private Reglas() {}
+
+              public static SharedPreferences prefs(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              public static boolean get(Context c, String clave) {
+                  boolean def;
+                  switch (clave) {
+                      case P600:
+                      case OCULTOS:
+                          def = false;
+                          break;
+                      default:
+                          def = true;
+                  }
+                  return prefs(c).getBoolean(clave, def);
+              }
+
+              public static String motivoBloqueo(Context c, String numeroCrudo) {
+                  if (!get(c, ACTIVO)) return null;
+
+                  if (numeroCrudo == null || numeroCrudo.trim().isEmpty()) {
+                      return get(c, OCULTOS) ? "Número oculto" : null;
+                  }
+
+                  if (get(c, CONTACTOS) && esContacto(c, numeroCrudo)) return null;
+
+                  String n = limpiar(numeroCrudo);
+                  String nacional;
+
+                  if (n.startsWith("+")) {
+                      if (!n.startsWith("+56")) return get(c, EXTRANJEROS) ? "Extranjero" : null;
+                      nacional = n.substring(3);
+                  } else if (n.startsWith("00")) {
+                      if (!n.startsWith("0056")) return get(c, EXTRANJEROS) ? "Extranjero" : null;
+                      nacional = n.substring(4);
+                  } else {
+                      nacional = n;
+                      if (nacional.startsWith("56") && nacional.length() >= 11) {
+                          nacional = nacional.substring(2);
+                      }
+                  }
+
+                  if (nacional.startsWith("809") && get(c, P809)) return "Telemarketing (809)";
+                  if (nacional.startsWith("600") && get(c, P600)) return "Empresa (600)";
+                  return null;
+              }
+
+              static String limpiar(String s) {
+                  StringBuilder b = new StringBuilder();
+                  String t = s.trim();
+                  for (int i = 0; i < t.length(); i++) {
+                      char ch = t.charAt(i);
+                      if (Character.isDigit(ch)) b.append(ch);
+                      else if (ch == '+' && b.length() == 0) b.append(ch);
+                  }
+                  return b.toString();
+              }
+
+              private static boolean esContacto(Context c, String numero) {
+                  if (c.checkSelfPermission(Manifest.permission.READ_CONTACTS)
+                          != PackageManager.PERMISSION_GRANTED) return false;
+                  Uri uri = Uri.withAppendedPath(
+                          ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(numero));
+                  try (Cursor cur = c.getContentResolver().query(
+                          uri, new String[]{ContactsContract.PhoneLookup._ID}, null, null, null)) {
+                      return cur != null && cur.moveToFirst();
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+          }
+          FIN
+          mkdir -p app/src/main/res/values app/src/main/res/drawable app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/values/colors.xml <<'FIN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="icono_fondo">#C62828</color>
+          </resources>
+          FIN
+          cat > app/src/main/res/values/strings.xml <<'FIN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Bloqueador de llamadas</string>
+          </resources>
+          FIN
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'FIN'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M42,38c2,-2 4,-2 5,0l4,6c1,2 1,3 -1,5l-2,2c2,4 5,7 9,9l2,-2c2,-2 3,-2 5,-1l6,4c2,1 2,3 0,5l-3,3c-3,3 -9,2 -17,-5c-8,-7 -11,-15 -8,-18z"/>
+              <path android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="5"
+                  android:pathData="M54,30a24,24 0,1 1,0 48a24,24 0,1 1,0 -48z"/>
+              <path android:fillColor="#00000000" android:strokeColor="#FFFFFF" android:strokeWidth="5"
+                  android:pathData="M37,37L71,71"/>
+          </vector>
+          FIN
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'FIN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icono_fondo" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          FIN
+          cp app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Compilar
+        run: gradle assembleRelease --no-daemon
+      - name: Renombrar APK
+        run: cp app/build/outputs/apk/release/*.apk BloqueadorLlamadas.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BloqueadorLlamadas-apk
+          path: BloqueadorLlamadas.apk
+      - name: Publicar descarga
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1
+          name: Bloqueador de llamadas
+          files: BloqueadorLlamadas.apk
